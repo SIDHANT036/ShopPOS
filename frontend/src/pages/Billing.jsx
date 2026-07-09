@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import api from "../api";
 import * as XLSX from "xlsx";
+import { Search, ScanLine, FileDown, FileText } from "lucide-react";
+import Cart from "../components/Cart";
 
 export default function Billing() {
   const [items, setItems] = useState([]);
   const [cart, setCart] = useState([]);
+  const [productSearch, setProductSearch] = useState("");
+  const [scanCode, setScanCode] = useState("");
+  const [lastInvoiceNo, setLastInvoiceNo] = useState(null);
+  const scanRef = useRef(null);
 
   useEffect(() => {
     loadItems();
@@ -21,101 +27,87 @@ export default function Billing() {
   }
 
   function add(item) {
-    const existing = cart.find((i) => i.id === item.id);
-
-    if (existing) {
-      setCart(
-        cart.map((i) =>
-          i.id === item.id
-            ? {
-                ...i,
-                qty: i.qty + 1,
-              }
-            : i
-        )
-      );
-    } else {
-      setCart([
-        ...cart,
-        {
-          ...item,
-          qty: 1,
-        },
-      ]);
-    }
+    setCart((cart) => {
+      const existing = cart.find((i) => i.id === item.id);
+      if (existing) {
+        return cart.map((i) => (i.id === item.id ? { ...i, qty: i.qty + 1 } : i));
+      }
+      return [...cart, { ...item, qty: 1 }];
+    });
   }
 
   function increase(id) {
-    setCart(
-      cart.map((i) =>
-        i.id === id
-          ? {
-              ...i,
-              qty: i.qty + 1,
-            }
-          : i
-      )
-    );
+    setCart((cart) => cart.map((i) => (i.id === id ? { ...i, qty: i.qty + 1 } : i)));
   }
 
   function decrease(id) {
-    setCart(
-      cart
-        .map((i) =>
-          i.id === id
-            ? {
-                ...i,
-                qty: i.qty - 1,
-              }
-            : i
-        )
-        .filter((i) => i.qty > 0)
+    setCart((cart) =>
+      cart.map((i) => (i.id === id ? { ...i, qty: i.qty - 1 } : i)).filter((i) => i.qty > 0)
     );
   }
 
-  const subtotal = useMemo(() => {
-    return cart.reduce(
-      (sum, item) => sum + item.price * item.qty,
-      0
-    );
-  }, [cart]);
+  function setQty(id, qty) {
+    setCart((cart) => (qty <= 0 ? cart.filter((i) => i.id !== id) : cart.map((i) => (i.id === id ? { ...i, qty } : i))));
+  }
 
-  const gst = subtotal * 0.18;
-  const total = subtotal + gst;
+  function removeItem(id) {
+    setCart((cart) => cart.filter((i) => i.id !== id));
+  }
 
-  function downloadExcel() {
-    const data = cart.map((i) => ({
+  function handleScan(e) {
+    if (e.key !== "Enter") return;
+    const code = scanCode.trim();
+    if (!code) return;
+
+    const match = items.find((i) => i.barcode && i.barcode === code);
+    if (match) {
+      add(match);
+    } else {
+      alert(`No item found with barcode "${code}".`);
+    }
+    setScanCode("");
+    scanRef.current?.focus();
+  }
+
+  const filteredProducts = items.filter((i) => {
+    const term = productSearch.toLowerCase();
+    return !term || i.name.toLowerCase().includes(term) || i.category.toLowerCase().includes(term);
+  });
+
+  // GST applied per line using each item's own rate - not a flat blanket rate,
+  // since different products can legitimately carry different GST slabs.
+  const subtotal = useMemo(() => cart.reduce((sum, i) => sum + i.price * i.qty, 0), [cart]);
+  const gstTotal = useMemo(
+    () => cart.reduce((sum, i) => sum + i.price * i.qty * ((i.gst || 0) / 100), 0),
+    [cart]
+  );
+  const total = subtotal + gstTotal;
+  const profit = useMemo(
+    () => cart.reduce((sum, i) => sum + (i.price - (i.cost || 0)) * i.qty, 0),
+    [cart]
+  );
+
+  function downloadExcel(invoiceNo) {
+    const rows = cart.map((i) => ({
       Item: i.name,
       Quantity: i.qty,
       Price: i.price,
-      Amount: i.price * i.qty,
+      "GST %": i.gst || 0,
+      Amount: (i.price * i.qty * (1 + (i.gst || 0) / 100)).toFixed(2),
     }));
+    rows.push({});
+    rows.push({ Item: "Subtotal", Amount: subtotal.toFixed(2) });
+    rows.push({ Item: "GST", Amount: gstTotal.toFixed(2) });
+    rows.push({ Item: "TOTAL", Amount: total.toFixed(2) });
 
-    data.push({});
-    data.push({
-      Item: "GST",
-      Amount: gst,
-    });
+    const sheet = XLSX.utils.json_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, sheet, "Invoice");
+    XLSX.writeFile(wb, `${invoiceNo || "Shop_Bill"}.xlsx`);
+  }
 
-    data.push({
-      Item: "TOTAL",
-      Amount: total,
-    });
-
-    const sheet = XLSX.utils.json_to_sheet(data);
-
-    const workbook = XLSX.utils.book_new();
-
-    XLSX.utils.book_append_sheet(
-      workbook,
-      sheet,
-      "Invoice"
-    );
-
-    XLSX.writeFile(
-      workbook,
-      "Shop_Bill.xlsx"
-    );
+  function downloadPdf(invoiceNo) {
+    window.open(`${api.defaults.baseURL}/invoice/${invoiceNo}`, "_blank");
   }
 
   async function completeSale() {
@@ -125,22 +117,21 @@ export default function Billing() {
     }
 
     try {
-      const invoice = {
-        invoiceNo: "INV-" + Date.now(),
-        items: cart,
-        gst,
+      const payload = {
+        items: cart.map((c) => ({ id: c.id, name: c.name, qty: c.qty, price: c.price, gst: c.gst || 0 })),
         total,
+        gst: gstTotal,
+        profit,
       };
 
-      await api.post("/sale", invoice);
+      const res = await api.post("/sale", payload);
+      const invoiceNo = res.data.invoiceNo;
 
-      // Keep Excel functionality
-      downloadExcel();
+      setLastInvoiceNo(invoiceNo);
+      downloadExcel(invoiceNo);
 
-      alert("Sale completed successfully.");
-
+      alert(`Sale completed. Invoice ${invoiceNo}.`);
       setCart([]);
-
       loadItems();
     } catch (err) {
       console.error(err);
@@ -149,94 +140,85 @@ export default function Billing() {
   }
 
   return (
-    <div>
-      <h1>Billing</h1>
+    <div className="page">
+      <div className="topbar">
+        <h1>Billing</h1>
+      </div>
 
-      <h3>Products</h3>
+      <div className="pos-layout">
+        <div>
+          <div className="scan-box">
+            <input
+              ref={scanRef}
+              placeholder="Scan barcode, then press Enter..."
+              value={scanCode}
+              onChange={(e) => setScanCode(e.target.value)}
+              onKeyDown={handleScan}
+            />
+            <ScanLine size={20} style={{ alignSelf: "center", color: "var(--ink-soft)" }} />
+          </div>
 
-      {items.map((item) => (
-        <button
-          key={item.id}
-          style={{ margin: 5 }}
-          onClick={() => add(item)}
-        >
-          {item.name} ₹{item.price}
-        </button>
-      ))}
+          <div className="search-box" style={{ marginBottom: 14 }}>
+            <Search size={16} />
+            <input
+              placeholder="Or search products..."
+              value={productSearch}
+              onChange={(e) => setProductSearch(e.target.value)}
+            />
+          </div>
 
-      <hr />
-
-      <h2>Cart</h2>
-
-      {cart.length === 0 && <p>Cart is empty.</p>}
-
-      {cart.map((c) => (
-        <div
-          key={c.id}
-          style={{
-            marginBottom: 10,
-          }}
-        >
-          <strong>{c.name}</strong>
-
-          {"  "}
-
-          ₹{c.price}
-
-          {"  "}
-
-          <button onClick={() => decrease(c.id)}>
-            -
-          </button>
-
-          <span
-            style={{
-              margin: "0 10px",
-            }}
-          >
-            {c.qty}
-          </span>
-
-          <button onClick={() => increase(c.id)}>
-            +
-          </button>
-
-          {"  =  ₹"}
-
-          {(c.qty * c.price).toFixed(2)}
+          <div className="product-grid">
+            {filteredProducts.map((item) => (
+              <button key={item.id} className="product-btn" onClick={() => add(item)}>
+                <span className="pname">{item.name}</span>
+                <span className="pmeta">
+                  ₹{item.price} · stock {item.quantity}
+                </span>
+              </button>
+            ))}
+          </div>
         </div>
-      ))}
 
-      <hr />
+        <div>
+          <div className="tape">
+            <h3 style={{ marginBottom: 12 }}>Current Bill</h3>
 
-      <h3>
-        Subtotal : ₹{subtotal.toFixed(2)}
-      </h3>
+            <Cart cart={cart} onIncrease={increase} onDecrease={decrease} onSetQty={setQty} onRemove={removeItem} />
 
-      <h3>
-        GST (18%) : ₹{gst.toFixed(2)}
-      </h3>
+            {cart.length > 0 && (
+              <div className="tape-totals">
+                <div className="line">
+                  <span>Subtotal</span>
+                  <span className="num">₹{subtotal.toFixed(2)}</span>
+                </div>
+                <div className="line">
+                  <span>GST</span>
+                  <span className="num">₹{gstTotal.toFixed(2)}</span>
+                </div>
+                <div className="grand">
+                  <span>Total</span>
+                  <span className="num">₹{total.toFixed(2)}</span>
+                </div>
+              </div>
+            )}
+          </div>
+          <div className="tape-edge" />
 
-      <h2>
-        Total : ₹{total.toFixed(2)}
-      </h2>
-
-      <button
-        onClick={downloadExcel}
-        disabled={!cart.length}
-      >
-        Download Excel Bill
-      </button>
-
-      <button
-        style={{
-          marginLeft: 10,
-        }}
-        onClick={completeSale}
-        disabled={!cart.length}
-      >
-        Complete Sale
-      </button>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
+            <button className="primary" onClick={completeSale} disabled={!cart.length}>
+              Complete Sale
+            </button>
+            <button onClick={() => downloadExcel(lastInvoiceNo)} disabled={!cart.length}>
+              <FileDown size={16} /> Download Excel Bill
+            </button>
+            {lastInvoiceNo && (
+              <button onClick={() => downloadPdf(lastInvoiceNo)}>
+                <FileText size={16} /> Download PDF Invoice ({lastInvoiceNo})
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
