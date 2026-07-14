@@ -1,5 +1,9 @@
 name: Build Windows installer
 
+# Builds the .exe on an actual Windows machine (via GitHub's hosted runner),
+# which is the reliable way to produce a Windows build from a Mac dev machine -
+# it sidesteps native-module (sqlite3) cross-compilation entirely, since the
+# native binary is compiled on Windows, for Windows, by electron-builder itself.
 on:
   push:
     tags:
